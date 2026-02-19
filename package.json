@@ -1,0 +1,20 @@
+{
+  "name": "@calesennett/pi-hn",
+  "version": "0.1.0",
+  "description": "Hacker News front-page reader extension for pi",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "hacker-news",
+    "hn"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/calesennett/pi-hn.git"
+  },
+  "homepage": "https://github.com/calesennett/pi-hn#readme",
+  "bugs": {
+    "url": "https://github.com/calesennett/pi-hn/issues"
+  }
+}
