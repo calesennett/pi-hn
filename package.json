@@ -1,6 +1,6 @@
 {
   "name": "@calesennett/pi-hn",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hacker News front-page reader extension for pi",
   "keywords": [
     "pi-package",
