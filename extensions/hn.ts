@@ -1,11 +1,36 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
+import { Readability } from "@mozilla/readability";
 import { Container, SelectList, Text } from "@mariozechner/pi-tui";
+import { JSDOM, VirtualConsole } from "jsdom";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 const HN_FRONT_PAGE_API = "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30";
+const ARTICLE_CONTEXT_MESSAGE_TYPE = "hn-article-context";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+interface ReadableArticle {
+	title: string;
+	url: string;
+	byline: string | null;
+	siteName: string | null;
+	excerpt: string | null;
+	textContent: string;
+	length: number;
+}
+
+interface ArticleContextDetails {
+	hnId: string;
+	title: string;
+	url: string;
+	siteName: string | null;
+	byline: string | null;
+	length: number;
+	charCount: number;
+	fetchedAt: string;
+}
 
 interface HNHit {
 	title: string | null;
@@ -248,6 +273,86 @@ function commentsUrl(hit: HNHit): string {
 	return `https://news.ycombinator.com/item?id=${encodeURIComponent(hit.objectID)}`;
 }
 
+function normalizeArticleText(text: string): string {
+	return text
+		.replace(/\u00a0/g, " ")
+		.replace(/\r/g, "")
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+function createArticleDom(html: string, url: string): JSDOM {
+	const virtualConsole = new VirtualConsole();
+	virtualConsole.on("jsdomError", (error) => {
+		if (error instanceof Error && error.message.includes("Could not parse CSS stylesheet")) return;
+		console.error(error);
+	});
+	return new JSDOM(html, { url, virtualConsole });
+}
+
+async function fetchReadableArticle(url: string): Promise<ReadableArticle> {
+	const response = await fetch(url, {
+		headers: {
+			accept: "text/html,application/xhtml+xml",
+			"user-agent": "pi-hn/0.1",
+		},
+	});
+	if (!response.ok) {
+		throw new Error(`Article request returned ${response.status}`);
+	}
+
+	const html = await response.text();
+	const resolvedUrl = response.url || url;
+	const dom = createArticleDom(html, resolvedUrl);
+	const fallbackDom = createArticleDom(html, resolvedUrl);
+	fallbackDom.window.document.querySelectorAll("script, style").forEach((node) => node.remove());
+	const fallbackText = normalizeArticleText(fallbackDom.window.document.body?.textContent ?? "");
+	const parsed = new Readability(dom.window.document).parse();
+	const textContent = normalizeArticleText(parsed?.textContent ?? fallbackText);
+	if (textContent.length === 0) {
+		throw new Error("Article had no readable text content");
+	}
+
+	return {
+		title: normalizeTitle(parsed?.title ?? dom.window.document.title),
+		url: resolvedUrl,
+		byline: parsed?.byline?.trim() || null,
+		siteName: parsed?.siteName?.trim() || null,
+		excerpt: parsed?.excerpt?.trim() || null,
+		textContent,
+		length: parsed?.length ?? textContent.length,
+	};
+}
+
+function buildArticleContext(hit: HNHit, article: ReadableArticle): { content: string; details: ArticleContextDetails } {
+	const title = article.title === "(untitled)" ? normalizeTitle(hit.title) : article.title;
+	const lines: string[] = [
+		`Title: ${title}`,
+		`URL: ${article.url}`,
+		`HN Comments: ${commentsUrl(hit)}`,
+	];
+
+	if (article.siteName) lines.push(`Site: ${article.siteName}`);
+	if (article.byline) lines.push(`Byline: ${article.byline}`);
+	if (article.excerpt) lines.push(`Excerpt: ${article.excerpt}`);
+	lines.push("", "Article Text:", article.textContent);
+
+	return {
+		content: lines.join("\n"),
+		details: {
+			hnId: hit.objectID,
+			title,
+			url: article.url,
+			siteName: article.siteName,
+			byline: article.byline,
+			length: article.length,
+			charCount: article.textContent.length,
+			fetchedAt: new Date().toISOString(),
+		},
+	};
+}
+
 async function openInBrowser(pi: ExtensionAPI, url: string): Promise<{ ok: boolean; error?: string }> {
 	const windowsQuotedUrl = `"${url.replace(/"/g, '""')}"`;
 	const result =
@@ -298,8 +403,28 @@ async function fetchFrontPage(): Promise<HNHit[]> {
 }
 
 export default function hackerNewsExtension(pi: ExtensionAPI) {
+	pi.registerMessageRenderer(ARTICLE_CONTEXT_MESSAGE_TYPE, (message, { expanded }, theme) => {
+		const details = (message.details ?? {}) as Partial<ArticleContextDetails>;
+		const title = details.title ?? "(untitled)";
+		const charCount = typeof details.charCount === "number" ? details.charCount : undefined;
+		const charLabel =
+			typeof charCount === "number" ? theme.fg("dim", ` (${charCount.toLocaleString()} chars)`) : "";
+
+		let text = `${theme.bold(`[${title}]`)}${charLabel}`;
+		if (expanded) {
+			if (details.url) text += `\n${theme.fg("muted", `URL: ${details.url}`)}`;
+			if (details.siteName) text += `\n${theme.fg("muted", `Site: ${details.siteName}`)}`;
+			if (details.byline) text += `\n${theme.fg("muted", `Byline: ${details.byline}`)}`;
+			if (details.fetchedAt) {
+				text += `\n${theme.fg("dim", `Fetched: ${new Date(details.fetchedAt).toLocaleString()}`)}`;
+			}
+		}
+
+		return new Text(text, 0, 0);
+	});
+
 	pi.registerCommand("hn", {
-		description: "Browse Hacker News front page in a list (a=article, c=comments)",
+		description: "Browse Hacker News front page (a/enter=article, x=add context, c=comments)",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) return;
 
@@ -345,7 +470,21 @@ export default function hackerNewsExtension(pi: ExtensionAPI) {
 
 				const pendingReadHits = new Map<string, HNHit>();
 				let uiClosed = false;
+				const hintText = [
+					`${theme.fg("dim", theme.bold("↑↓/j/k"))} ${theme.fg("dim", "navigate")}`,
+					`${theme.fg("dim", theme.bold("enter/a"))} ${theme.fg("dim", "article")}`,
+					`${theme.fg("dim", theme.bold("x"))} ${theme.fg("dim", "add to context")}`,
+					`${theme.fg("dim", theme.bold("c"))} ${theme.fg("dim", "comments")}`,
+					`${theme.fg("dim", theme.bold("esc"))} ${theme.fg("dim", "close")}`,
+				].join(theme.fg("dim", " • "));
+				const hint = new Text(hintText);
+				let contextLoadHit: HNHit | null = null;
+				let spinnerFrame = 0;
+				let spinnerTimer: ReturnType<typeof setInterval> | undefined;
+
 				const flushPendingReads = () => {
+					if (pendingReadHits.size === 0) return;
+
 					const result = persistReadArticles([...pendingReadHits.values()]);
 					if (!result.ok) {
 						ctx.ui.notify(
@@ -357,9 +496,42 @@ export default function hackerNewsExtension(pi: ExtensionAPI) {
 					pendingReadHits.clear();
 				};
 
+				const setHint = (text: string) => {
+					hint.setText(text);
+					hint.invalidate();
+					if (!uiClosed) tui.requestRender();
+				};
+
+				const updateHint = (text: string, color: "dim" | "warning" = "dim") => {
+					setHint(theme.fg(color, text));
+				};
+
+				const stopContextSpinner = () => {
+					if (spinnerTimer) {
+						clearInterval(spinnerTimer);
+						spinnerTimer = undefined;
+					}
+					contextLoadHit = null;
+					spinnerFrame = 0;
+					setHint(hintText);
+				};
+
+				const startContextSpinner = (hit: HNHit) => {
+					contextLoadHit = hit;
+					spinnerFrame = 0;
+					const animate = () => {
+						const frame = SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length] ?? "*";
+						spinnerFrame += 1;
+						updateHint(`${frame} fetching article and adding to session context...`, "warning");
+					};
+					animate();
+					spinnerTimer = setInterval(animate, 110);
+				};
+
 				const closeUi = () => {
 					if (uiClosed) return;
 					uiClosed = true;
+					stopContextSpinner();
 					flushPendingReads();
 					done();
 				};
@@ -389,20 +561,7 @@ export default function hackerNewsExtension(pi: ExtensionAPI) {
 					return hitsById.get(selected.value);
 				};
 
-				const openSelectedArticle = async () => {
-					const hit = getSelectedHit();
-					if (!hit) return;
-					if (!hit.url) {
-						ctx.ui.notify("This item has no article URL.", "warning");
-						return;
-					}
-
-					const result = await openInBrowser(pi, hit.url);
-					if (!result.ok) {
-						ctx.ui.notify(`Could not open article: ${result.error ?? "Unknown error"}`, "error");
-						return;
-					}
-
+				const markHitRead = (hit: HNHit) => {
 					pendingReadHits.set(hit.objectID, hit);
 					readArticleIds.add(hit.objectID);
 
@@ -422,6 +581,61 @@ export default function hackerNewsExtension(pi: ExtensionAPI) {
 					}
 				};
 
+				const openSelectedArticle = async () => {
+					const hit = getSelectedHit();
+					if (!hit) return;
+					if (!hit.url) {
+						ctx.ui.notify("This item has no article URL.", "warning");
+						return;
+					}
+
+					const result = await openInBrowser(pi, hit.url);
+					if (!result.ok) {
+						ctx.ui.notify(`Could not open article: ${result.error ?? "Unknown error"}`, "error");
+						return;
+					}
+
+					markHitRead(hit);
+				};
+
+				const addSelectedArticleToContext = async () => {
+					const hit = getSelectedHit();
+					if (!hit) return;
+					if (!hit.url) {
+						ctx.ui.notify("This item has no article URL.", "warning");
+						return;
+					}
+					if (contextLoadHit) {
+						ctx.ui.notify(`Already fetching: ${normalizeTitle(contextLoadHit.title)}`, "warning");
+						return;
+					}
+
+					startContextSpinner(hit);
+					try {
+						const article = await fetchReadableArticle(hit.url);
+						if (uiClosed) return;
+						const contextMessage = buildArticleContext(hit, article);
+						pi.sendMessage(
+							{
+								customType: ARTICLE_CONTEXT_MESSAGE_TYPE,
+								content: contextMessage.content,
+								details: contextMessage.details,
+								display: true,
+							},
+							{ triggerTurn: false },
+						);
+						markHitRead(hit);
+						const addedTitle = article.title === "(untitled)" ? normalizeTitle(hit.title) : article.title;
+						ctx.ui.notify(`Added to session context: ${addedTitle}`, "info");
+					} catch (error) {
+						if (!uiClosed) {
+							ctx.ui.notify(`Could not add article to context: ${getErrorMessage(error)}`, "error");
+						}
+					} finally {
+						stopContextSpinner();
+					}
+				};
+
 				const openSelectedComments = async () => {
 					const hit = getSelectedHit();
 					if (!hit) return;
@@ -438,9 +652,7 @@ export default function hackerNewsExtension(pi: ExtensionAPI) {
 				selectList.onCancel = () => closeUi();
 
 				container.addChild(selectList);
-				container.addChild(
-					new Text(theme.fg("dim", "↑↓/j/k navigate • enter/a article • c comments • esc close")),
-				);
+				container.addChild(hint);
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 
 				return {
@@ -451,6 +663,10 @@ export default function hackerNewsExtension(pi: ExtensionAPI) {
 						container.invalidate();
 					},
 					handleInput(data: string) {
+						if (data === "x" || data === "X") {
+							void addSelectedArticleToContext();
+							return;
+						}
 						if (data === "a" || data === "A") {
 							void openSelectedArticle();
 							return;

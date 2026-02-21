@@ -7,10 +7,11 @@ A simple Hacker News front-page reader extension for [pi](https://github.com/bad
 ## Features
 
 - `/hn` command opens a selectable front-page list
-- Read tracking is stored in a local JSON file at `~/.pi/agent/data/pi-hn/db.json` (or `$PI_CODING_AGENT_DIR/data/pi-hn/db.json`)
 - `j/k` (and arrow keys) navigate the list
 - `a` or `Enter` opens the article URL
+- `x` fetches and parses the selected article (via Readability) and adds it to session context for follow-up prompts
 - `c` opens comments in browser
+- Read tracking is stored in a local JSON file at `~/.pi/agent/data/pi-hn/db.json` (or `$PI_CODING_AGENT_DIR/data/pi-hn/db.json`)
 
 ## Install
 
