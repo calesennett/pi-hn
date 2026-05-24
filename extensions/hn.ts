@@ -1,8 +1,8 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Readability } from "@mozilla/readability";
-import { Container, SelectList, Text } from "@mariozechner/pi-tui";
-import { JSDOM, VirtualConsole } from "jsdom";
+import { Container, SelectList, Text } from "@earendil-works/pi-tui";
+import { createArticleWindow } from "./article-html.ts";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -282,15 +282,6 @@ function normalizeArticleText(text: string): string {
 		.trim();
 }
 
-function createArticleDom(html: string, url: string): JSDOM {
-	const virtualConsole = new VirtualConsole();
-	virtualConsole.on("jsdomError", (error) => {
-		if (error instanceof Error && error.message.includes("Could not parse CSS stylesheet")) return;
-		console.error(error);
-	});
-	return new JSDOM(html, { url, virtualConsole });
-}
-
 async function fetchReadableArticle(url: string): Promise<ReadableArticle> {
 	const response = await fetch(url, {
 		headers: {
@@ -304,18 +295,18 @@ async function fetchReadableArticle(url: string): Promise<ReadableArticle> {
 
 	const html = await response.text();
 	const resolvedUrl = response.url || url;
-	const dom = createArticleDom(html, resolvedUrl);
-	const fallbackDom = createArticleDom(html, resolvedUrl);
-	fallbackDom.window.document.querySelectorAll("script, style").forEach((node) => node.remove());
-	const fallbackText = normalizeArticleText(fallbackDom.window.document.body?.textContent ?? "");
-	const parsed = new Readability(dom.window.document).parse();
+	const dom = createArticleWindow(html);
+	const fallbackDom = createArticleWindow(html);
+	fallbackDom.document.querySelectorAll("script, style").forEach((node) => node.remove());
+	const fallbackText = normalizeArticleText(fallbackDom.document.body?.textContent ?? "");
+	const parsed = new Readability(dom.document).parse();
 	const textContent = normalizeArticleText(parsed?.textContent ?? fallbackText);
 	if (textContent.length === 0) {
 		throw new Error("Article had no readable text content");
 	}
 
 	return {
-		title: normalizeTitle(parsed?.title ?? dom.window.document.title),
+		title: normalizeTitle(parsed?.title ?? dom.document.title),
 		url: resolvedUrl,
 		byline: parsed?.byline?.trim() || null,
 		siteName: parsed?.siteName?.trim() || null,
